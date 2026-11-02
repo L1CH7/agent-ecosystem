@@ -11,22 +11,15 @@ agent-ecosystem/
 ├── .gitignore               # Изоляция локальных БД, кэшей и ключей
 ├── symlink.sh               # Универсальный установщик симлинков под целевые IDE
 ├── README.md                # Спецификация экосистемы
-├── rules/                   # Глобальные поведенческие регламенты
-│   ├── 00-universal-etiquette-and-tooling.md
-│   ├── 01-commit-standard.md
-│   ├── 02-execution-lifecycle-and-supervision.md
-│   ├── 03-context-lifecycle-and-scope-lock.md
-│   └── 04-extract-once-and-inspect.md
-├── skills/                  # Авторские инженерные и исследовательские навыки
-│   ├── deep-research/
-│   ├── russian-document-craft/
-│   ├── git-worktree-orchestrator/
-│   ├── subagent-drift-guard/
-│   ├── web-data-miner/
-│   └── graphify/
-├── plugins/                 # Плагины и расширения
-│   └── osint-suite/         # Комплекс OSINT-разведки (19 навыков + регламент AGENTS.md)
-└── mcp-servers/             # Высокопроизводительные MCP-серверы со своими .gitignore
+├── rules/                   # Глобальные поведенческие регламенты (00-04)
+├── skills/                  # Общесистемные базовые навыки
+│   ├── web-data-miner/      # Парсинг и сбор данных
+│   └── graphify/            # Построение графов знаний
+├── plugins/                 # Специализированные плагины (правила + навыки)
+│   ├── osint-suite/         # Разведка OSINT (19 навыков + регламент AGENTS.md)
+│   ├── academic-craft/      # Научные публикации (PEER, Inside-Out, Beeblio-матрица, ARIS-достоверность, ГОСТ)
+│   └── code-craft/          # Инженерия кода (Physical Oracle для CFD, ADR, VibeWise, Worktree, Drift Guard)
+└── mcp-servers/             # Высокопроизводительные поисковые шлюзы
     ├── google-search/       # Gemini Search Grounding (отчеты FTS5 BM25, Dual-Stage Fallback)
     └── exa-search/          # Exa.ai SDK Grounding (0.5-2с поиск, балансировщик ключей, FTS5 BM25)
 ```
