@@ -112,8 +112,10 @@ case "$IDE_MODE" in
         echo -e "${BOLD}[1/5] Проброс глобальных регламентов (rules)...${NC}"
         link_item "$MODULE_DIR/rules" "$TARGET/config/rules"
 
-        echo -e "\n${BOLD}[2/5] Проброс навыков (skills)...${NC}"
-        link_item "$MODULE_DIR/skills" "$TARGET/config/skills"
+        if [ -d "$MODULE_DIR/skills" ]; then
+            echo -e "\n${BOLD}[2/5] Проброс навыков (skills)...${NC}"
+            link_item "$MODULE_DIR/skills" "$TARGET/config/skills"
+        fi
 
         echo -e "\n${BOLD}[3/5] Проброс плагинов (plugins)...${NC}"
         mkdir -p "$TARGET/config/plugins"
