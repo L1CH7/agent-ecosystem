@@ -1,0 +1,9 @@
+# Exa MCP Server local secrets and cache
+keys.txt
+key_status.json
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+*.log

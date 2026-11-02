@@ -1,0 +1,25 @@
+# Байткод и кэши Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Базы данных и временные файлы SQLite
+*.db
+*.db-wal
+*.db-shm
+
+# Секреты и локальное состояние
+keys.txt
+key_status.json
+
+# Логи и дампы
+*.log
+reports/
+data/
+
+# Редакторы и ОС
+.DS_Store
+Thumbs.db
+*~
+*.swp

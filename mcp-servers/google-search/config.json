@@ -1,0 +1,8 @@
+{
+  "storage_dir": "/var/tmp/scratch/google_library",
+  "retention_days": 30,
+  "antigravity_url": "http://127.0.0.1:8045",
+  "primary_model": "gemini-3.8-flash-tiered",
+  "fallback_model": "gemini-3.8-flash-high",
+  "timeout_seconds": 140.0
+}

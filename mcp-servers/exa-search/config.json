@@ -1,0 +1,8 @@
+{
+  "storage_dir": "/var/tmp/scratch/exa_library",
+  "retention_days": 30,
+  "proxy_url": "",
+  "default_num_results": 5,
+  "default_max_characters": 2500,
+  "highlights": true
+}

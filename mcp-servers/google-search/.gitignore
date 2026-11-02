@@ -1,0 +1,9 @@
+# Google Search Grounding MCP local database, reports and cache
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+*.log
+reports/
+data/

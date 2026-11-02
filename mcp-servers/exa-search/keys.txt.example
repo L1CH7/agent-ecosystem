@@ -1,0 +1,4 @@
+# Список API ключей Exa.ai (по одному на строку)
+# Скопируйте этот файл в keys.txt и укажите ваш реальный ключ:
+# cp keys.txt.example keys.txt
+# your-exa-api-key-here
