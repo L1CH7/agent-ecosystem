@@ -17,12 +17,14 @@ import hashlib
 import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from exa_py import Exa
 from mcp.server.fastmcp import FastMCP
 from mcp.types import Tool as MCPTool
 
 mcp = FastMCP("ExaSearchGrounding")
+
+MAX_PROMPT_CHARS = 200_000  # Защита от переполнения контекста (~50,000 токенов)
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config.json"
@@ -509,14 +511,30 @@ async def exa_search(
     category: Optional[str] = None,
     include_domains: Optional[List[str]] = None,
     exclude_domains: Optional[List[str]] = None,
-    highlights: bool = True
+    highlights: bool = True,
+    text_max_characters: int = 2500
 ) -> str:
     """
     Основной семантический веб-поиск через официальный SDK exa-py.
-    Все найденные материалы автоматически индексируются в локальную библиотеку (SQLite FTS5) для быстрого повторного доступа.
+    Все найденные материалы автоматически индексируются в локальную библиотеку (SQLite FTS5).
+
+    Параметры:
+    - query: текст запроса или описание предмета поиска (до 200,000 символов).
+    - project: имя проекта для каталогизации в библиотеке (по умолчанию 'default').
+    - num_results: количество возвращаемых результатов (1-10).
+    - search_type: 'auto', 'neural' или 'keyword' (официальные типы поиска Exa).
+    - category: фильтрация по категории Exa ('company', 'research paper', 'news', 'pdf', 'github').
+    - highlights: извлекать ли релевантные цитаты (highlights).
+    - text_max_characters: максимальный объем чистого текста страницы (по умолчанию 2500).
     """
+    if not query or not query.strip():
+        return "Ошибка: пустой поисковый запрос Exa."
+
+    if len(query) > MAX_PROMPT_CHARS:
+        return f"Ошибка: длина запроса ({len(query)} симв.) превышает лимит {MAX_PROMPT_CHARS} символов."
+
     contents_dict = {
-        "text": {"max_characters": 2500}
+        "text": {"max_characters": text_max_characters}
     }
     if highlights:
         contents_dict["highlights"] = {"max_characters": 500}
@@ -683,24 +701,46 @@ async def exa_get_contents(urls: List[str], project: str = "default", text_max_c
 
 
 @mcp.tool()
-async def exa_search_batch(queries: List[str], project: str = "default", num_results: int = 3, highlights: bool = True) -> str:
+async def exa_search_batch(
+    queries: List[str],
+    project: str = "default",
+    num_results: int = 3,
+    highlights: bool = True,
+    text_max_characters: int = 2500
+) -> str:
     """
     Пакетный параллельный запуск нескольких семантических поисков через asyncio.gather за 1-3 секунды.
     Идеально для исследования многогранных инженерных тем без задержек.
+
+    Параметры:
+    - queries: список поисковых запросов.
+    - project: имя проекта для каталогизации.
+    - num_results: количество результатов на каждый запрос.
+    - highlights: извлекать ли релевантные цитаты.
+    - text_max_characters: максимальный объем текста (по умолчанию 2500).
     """
     if not queries:
         return "Список запросов пуст."
 
     tasks = [
-        exa_search(query=q, project=project, num_results=num_results, highlights=highlights)
+        exa_search(
+            query=q,
+            project=project,
+            num_results=num_results,
+            highlights=highlights,
+            text_max_characters=text_max_characters
+        )
         for q in queries
     ]
-    results = await asyncio.gather(*tasks)
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     formatted = []
-    total = len(results)
-    for idx, (q, res) in enumerate(zip(queries, results), start=1):
-        formatted.append(f"=== [ПАКЕТ {idx}/{total}] Запрос: {q} ===\n\n{res}\n")
+    total = len(queries)
+    for idx, (q, res) in enumerate(zip(queries, raw_results), start=1):
+        if isinstance(res, Exception):
+            formatted.append(f"=== [ПАКЕТ {idx}/{total}] Запрос: {q} ===\n\nОшибка выполнения: {type(res).__name__}: {str(res)}\n")
+        else:
+            formatted.append(f"=== [ПАКЕТ {idx}/{total}] Запрос: {q} ===\n\n{res}\n")
 
     return "\n" + "\n".join(formatted)
 

@@ -16,7 +16,7 @@ import hashlib
 import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple, Union
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.types import Tool as MCPTool
@@ -63,13 +63,69 @@ ANTIGRAVITY_BASE_URL = ANTIGRAVITY_RAW
 DEFAULT_BASE_MODEL = os.environ.get("ANTIGRAVITY_MODEL") or CONFIG.get("primary_model", "gemini-3.8-flash-tiered")
 FALLBACK_MODEL = CONFIG.get("fallback_model", "gemini-3.8-flash-high")
 REQUEST_TIMEOUT = float(CONFIG.get("timeout_seconds", 140.0))
+MAX_PROMPT_CHARS = 200_000  # Защита от переполнения контекста (~50,000 токенов)
+
+HTTP_LIMITS = httpx.Limits(max_keepalive_connections=20, max_connections=50)
+
+# Алиасы моделей: только легковесные поисковые модели (защита от дорогих моделей типа Pro/Argon)
+MODEL_ALIASES = {
+    "flash": "gemini-3.8-flash-tiered",
+    "flash-tiered": "gemini-3.8-flash-tiered",
+    "flash-high": "gemini-3.8-flash-high",
+    "flash-medium": "gemini-3.8-flash-medium",
+    "flash-3.7": "gemini-3.7-flash-high",
+    "flash-3.8": "gemini-3.8-flash-tiered",
+    "gemini-flash": "gemini-3.8-flash-tiered",
+}
 
 
-def get_search_agent_name(base_model: str) -> str:
-    clean = base_model.strip()
+def resolve_model_name(model_name: str, endpoint_type: str = "v1beta") -> str:
+    """
+    Разрешает имя модели с учетом алиасов и автоподстановки суффикса -online.
+    Для OpenAI /v1 роута суффикс -online обязателен.
+    Для нативного /v1beta роута суффикс -online отсекается.
+    """
+    clean = model_name.strip()
     has_online = clean.endswith("-online")
-    raw = clean[:-7] if has_online else clean
-    return MODEL_ALIASES.get(raw, raw)
+    base = clean[:-7] if has_online else clean
+    canonical_base = MODEL_ALIASES.get(base.lower(), base)
+
+    if endpoint_type == "v1":
+        return canonical_base if canonical_base.endswith("-online") else f"{canonical_base}-online"
+    else:
+        return canonical_base[:-7] if canonical_base.endswith("-online") else canonical_base
+
+
+def parse_detail_level(level: Any) -> Tuple[str, str]:
+    """
+    Нормализует уровень детализации с поддержкой строковых и числовых алиасов (log-level style).
+    - 0 / quick: минимализм, ключевые цифры, даты, ссылки на первоисточники без лишней воды.
+    - 1 / balanced: структурированный сбалансированный ответ.
+    - 2 / comprehensive: глубокий технический разбор с таблицами, формулами и цитатами.
+    """
+    lvl_str = str(level).strip().lower()
+
+    if lvl_str in ("0", "quick", "concise", "fast", "brief"):
+        name = "quick"
+        instruction = (
+            "Предоставь максимально краткий, лаконичный, строго фактологический ответ по результатам поиска. "
+            "Выдели ключевые даты, числа, статус и прямые ссылки на первоисточники без общих рассуждений."
+        )
+    elif lvl_str in ("1", "balanced", "standard", "normal"):
+        name = "balanced"
+        instruction = (
+            "Выполни структурированный и взвешенный аналитический ответ. "
+            "Приведи основные факты, сопоставь найденные точки зрения и обязательно сохрани ссылки на подтверждающие источники."
+        )
+    else:
+        name = "comprehensive"
+        instruction = (
+            "Выполни исчерпывающий, глубокий аналитический разбор с использованием живого поиска. "
+            "Структурируй ответ четкими разделами, приводи точные цитаты, формулы, сравнительные таблицы параметров "
+            "и полный список верифицированных ссылок на первоисточники."
+        )
+
+    return name, instruction
 
 
 def slugify(text: str) -> str:
@@ -263,68 +319,143 @@ class GoogleKnowledgeLibrary:
 library = GoogleKnowledgeLibrary(LIBRARY_DB_PATH)
 
 
-async def _execute_single_query_with_retry(client: httpx.AsyncClient, query: str, primary_model: str, project: str) -> dict:
+async def _execute_single_query_with_retry(
+    client: httpx.AsyncClient,
+    query: str,
+    primary_model: str,
+    project: str,
+    detail_level: Union[str, int] = "comprehensive"
+) -> dict:
+    if not query or not query.strip():
+        return {
+            "query": query,
+            "status": "error",
+            "content": "Ошибка: пустой поисковый запрос.",
+            "model_used": "none",
+            "report_file": None,
+            "project": project
+        }
+
+    if len(query) > MAX_PROMPT_CHARS:
+        return {
+            "query": query,
+            "status": "error",
+            "content": f"Ошибка: длина запроса ({len(query)} симв.) превышает лимит {MAX_PROMPT_CHARS} символов.",
+            "model_used": "none",
+            "report_file": None,
+            "project": project
+        }
+
+    level_name, system_instruction = parse_detail_level(detail_level)
+
     models_to_try = [primary_model]
-    if primary_model != FALLBACK_MODEL:
+    if FALLBACK_MODEL and FALLBACK_MODEL not in models_to_try:
         models_to_try.append(FALLBACK_MODEL)
+    if "gemini-3.8-flash-tiered" not in models_to_try and "gemini-3.8-flash" not in models_to_try:
+        models_to_try.append("gemini-3.8-flash-tiered")
 
     last_err = ""
     for target_model in models_to_try:
-        canonical_model = get_search_agent_name(target_model)
-        is_gemini = "gemini" in canonical_model.lower()
+        canonical_model = resolve_model_name(target_model, endpoint_type="v1beta")
 
-        if is_gemini:
-            url = f"{ANTIGRAVITY_BASE_URL}/v1beta/models/{canonical_model}:generateContent"
-            payload = {
-                "contents": [{"role": "user", "parts": [{"text": query}]}],
-                "tools": [{"googleSearch": {}}]
-            }
-        else:
-            url = f"{ANTIGRAVITY_BASE_URL}/v1/chat/completions"
-            payload = {
-                "model": canonical_model,
-                "messages": [{"role": "user", "content": query}]
-            }
+        # 1. Сначала пробуем нативный Gemini Grounding через /v1beta
+        url_v1beta = f"{ANTIGRAVITY_BASE_URL}/v1beta/models/{canonical_model}:generateContent"
+        payload_v1beta = {
+            "contents": [{"role": "user", "parts": [{"text": query}]}],
+            "systemInstruction": {"parts": [{"text": system_instruction}]},
+            "tools": [{"googleSearch": {}}]
+        }
 
         try:
-            response = await client.post(url, json=payload, timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=10.0))
-            response.raise_for_status()
-            data = response.json()
+            resp = await client.post(
+                url_v1beta,
+                json=payload_v1beta,
+                timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=10.0)
+            )
 
-            content = ""
-            if is_gemini:
+            # Перехват HTTP 429 (Rate Limit)
+            if resp.status_code == 429:
+                sys.stderr.write(f"[GOOGLE-SEARCH] HTTP 429 на {canonical_model} (/v1beta). Переключаемся на резерв...\n")
+                last_err = f"HTTP 429 (Rate Limit) на {canonical_model}"
+                continue
+
+            if resp.status_code == 200:
+                data = resp.json()
                 candidates = data.get("candidates", [])
                 if candidates:
                     parts = candidates[0].get("content", {}).get("parts", [])
+                    # Фильтрация рассуждений модели (thought)
                     text_parts = [p.get("text", "") for p in parts if p.get("text") and not p.get("thought")]
                     if not text_parts:
                         text_parts = [p.get("text", "") for p in parts if p.get("text")]
                     content = "".join(text_parts).strip()
-            else:
-                if "choices" in data and len(data["choices"]) > 0:
-                    content = data["choices"][0]["message"]["content"]
+                    if content and content != "task ready":
+                        report_file = library.store_report(
+                            project=project,
+                            query=query,
+                            content=content,
+                            model_used=canonical_model
+                        )
+                        return {
+                            "query": query,
+                            "status": "success",
+                            "content": content,
+                            "model_used": canonical_model,
+                            "report_file": report_file,
+                            "project": project
+                        }
 
-            if content:
-                report_file = library.store_report(
-                    project=project,
-                    query=query,
-                    content=content,
-                    model_used=canonical_model
-                )
-                return {
-                    "query": query,
-                    "status": "success",
-                    "content": content,
-                    "model_used": canonical_model,
-                    "report_file": report_file,
-                    "project": project
-                }
+            # 2. Если /v1beta не ответил нужным контентом, пробуем совместимый роут /v1 с автоподстановкой -online
+            online_model = resolve_model_name(target_model, endpoint_type="v1")
+            url_v1 = f"{ANTIGRAVITY_BASE_URL}/v1/chat/completions"
+            payload_v1 = {
+                "model": online_model,
+                "messages": [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": query}
+                ]
+            }
+            resp_v1 = await client.post(
+                url_v1,
+                json=payload_v1,
+                timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=10.0)
+            )
+
+            if resp_v1.status_code == 429:
+                sys.stderr.write(f"[GOOGLE-SEARCH] HTTP 429 на {online_model} (/v1). Переход к резерву...\n")
+                last_err = f"HTTP 429 на {online_model}"
+                continue
+
+            if resp_v1.status_code == 200:
+                data_v1 = resp_v1.json()
+                choices = data_v1.get("choices", [])
+                if choices:
+                    content = choices[0].get("message", {}).get("content", "").strip()
+                    if content and content != "task ready":
+                        report_file = library.store_report(
+                            project=project,
+                            query=query,
+                            content=content,
+                            model_used=online_model
+                        )
+                        return {
+                            "query": query,
+                            "status": "success",
+                            "content": content,
+                            "model_used": online_model,
+                            "report_file": report_file,
+                            "project": project
+                        }
+            else:
+                last_err = f"HTTP {resp_v1.status_code}: {resp_v1.text[:200]}"
 
         except httpx.TimeoutException:
             last_err = f"Таймаут ({REQUEST_TIMEOUT}s) на модели {canonical_model}"
+            sys.stderr.write(f"[GOOGLE-SEARCH] {last_err}\n")
             continue
         except Exception as e:
             last_err = f"Ошибка ({canonical_model}): {e}"
+            sys.stderr.write(f"[GOOGLE-SEARCH] {last_err}\n")
             continue
 
     return {
@@ -332,7 +463,7 @@ async def _execute_single_query_with_retry(client: httpx.AsyncClient, query: str
         "status": "error",
         "content": (
             f"⚠️ ВНИМАНИЕ АГЕНТУ: Локальный шлюз Google Grounding временно не ответил ({last_err}).\n"
-            f"КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО вызывать стоковый инструмент `search_web` (он не работает и дает шум)!\n"
+            f"КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО вызывать стоковый инструмент `search_web` (он дает шум)!\n"
             f"Вместо этого используйте `exa_search` (сервер `exa-search`) либо локальную библиотеку `google_library_search`."
         ),
         "model_used": "none",
@@ -350,7 +481,7 @@ async def check_model_liveness() -> str:
     gateway_status = "НЕДОСТУПЕН"
     ping_ms = 0.0
     try:
-        async with httpx.AsyncClient(timeout=4.0) as client:
+        async with httpx.AsyncClient(timeout=4.0, limits=HTTP_LIMITS) as client:
             resp = await client.get(f"{ANTIGRAVITY_BASE_URL}/v1/models")
             if resp.status_code == 200:
                 ping_ms = round((time.time() - start) * 1000, 1)
@@ -369,21 +500,27 @@ async def check_model_liveness() -> str:
 
 
 @mcp.tool()
-async def google_search(query: str, project: str = "default", model_override: Optional[str] = None) -> str:
+async def google_search(
+    query: str,
+    project: str = "default",
+    detail_level: Union[str, int] = "comprehensive",
+    model_override: Optional[str] = None
+) -> str:
     """
     Выполняет глубокое аналитическое исследование Google Search с использованием Gemini Search Grounding.
     Все результаты автоматически сохраняются в структурированные Markdown-файлы по проектам и индексируются в SQLite FTS5.
 
     Параметры:
-    - query: развернутая постановка инженерной или исследовательской задачи на естественном языке.
+    - query: постановка задачи на естественном языке (до 200,000 символов).
     - project: название подпроекта для изоляции данных (например: 'gzla-cfd', 'plasma-article', 'default').
-    - model_override: переопределение модели.
+    - detail_level: уровень детализации (0/'quick' — краткий фактологический, 1/'balanced' — стандартный, 2/'comprehensive' — глубокий технический разбор с таблицами и формулами).
+    - model_override: явное указание модели (по умолчанию используется легковесная flash-модель).
     """
     base = model_override if model_override else DEFAULT_BASE_MODEL
     total_timeout = httpx.Timeout(REQUEST_TIMEOUT * 2 + 10.0, connect=10.0)
 
-    async with httpx.AsyncClient(timeout=total_timeout) as client:
-        res = await _execute_single_query_with_retry(client, query, base, project)
+    async with httpx.AsyncClient(timeout=total_timeout, limits=HTTP_LIMITS) as client:
+        res = await _execute_single_query_with_retry(client, query, base, project, detail_level)
         if res["status"] == "success" and res.get("report_file"):
             header = f"### [Google Grounding] Отчет сохранен: [{Path(res['report_file']).name}](file://{res['report_file']})\n"
             header += f"*Проект: `{res['project']}` | Модель: `{res['model_used']}`*\n\n"
@@ -392,21 +529,40 @@ async def google_search(query: str, project: str = "default", model_override: Op
 
 
 @mcp.tool()
-async def google_search_batch(queries: List[str], project: str = "default", model_override: Optional[str] = None) -> str:
+async def google_search_batch(
+    queries: List[str],
+    project: str = "default",
+    detail_level: Union[str, int] = "comprehensive",
+    model_override: Optional[str] = None
+) -> str:
     """
-    Параллельный запуск нескольких независимых исследовательских сессий Google Grounding через asyncio.gather.
-    Все отчеты сохраняются в Markdown-файлы с именами по темам и индексируются в базу проекта.
+    Параллельный неблокирующий запуск пачки независимых исследовательских сессий Google Grounding через asyncio.gather.
+    Каждый запрос выполняется независимо, сбои отдельных запросов изолируются.
+    Все отчеты сохраняются в Markdown-файлы и индексируются в базу проекта.
     """
     if not queries:
         return "Список запросов пуст."
 
     base = model_override if model_override else DEFAULT_BASE_MODEL
     total_timeout = httpx.Timeout(REQUEST_TIMEOUT * 2 + 10.0, connect=10.0)
-    limits = httpx.Limits(max_keepalive_connections=20, max_connections=50)
 
-    async with httpx.AsyncClient(timeout=total_timeout, limits=limits) as client:
-        tasks = [_execute_single_query_with_retry(client, q, base, project) for q in queries]
-        results = await asyncio.gather(*tasks)
+    async with httpx.AsyncClient(timeout=total_timeout, limits=HTTP_LIMITS) as client:
+        tasks = [_execute_single_query_with_retry(client, q, base, project, detail_level) for q in queries]
+        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    results = []
+    for q, item in zip(queries, raw_results):
+        if isinstance(item, Exception):
+            results.append({
+                "query": q,
+                "status": "error",
+                "content": f"Исключение при выполнении запроса: {type(item).__name__}: {str(item)}",
+                "model_used": "none",
+                "report_file": None,
+                "project": project
+            })
+        else:
+            results.append(item)
 
     formatted = []
     total = len(results)
